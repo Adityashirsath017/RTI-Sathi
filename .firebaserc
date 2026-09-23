@@ -1,5 +1,15 @@
 {
   "projects": {
     "default": "rti-black-hole"
-  }
+  },
+  "targets": {
+    "rti-black-hole": {
+      "hosting": {
+        "clerk": [
+          "rti-sathi-clerk"
+        ]
+      }
+    }
+  },
+  "etags": {}
 }
