@@ -1,0 +1,211 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ============================================================
+    // AUTHENTICATION & ROLE HELPERS
+    // ============================================================
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    // Identifies Routing Officers / Clerks and System Administrators
+    function isClerkOrAdmin() {
+      return isAuthenticated() && (
+        request.auth.token.role in ['clerk', 'admin'] ||
+        (exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+         get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role in ['clerk', 'admin']) ||
+        exists(/databases/$(database)/documents/clerks/$(request.auth.uid))
+      );
+    }
+
+    // ============================================================
+    // USER PROFILES
+    // ============================================================
+    match /users/{userId} {
+      allow read: if isAuthenticated() && (request.auth.uid == userId || isClerkOrAdmin());
+      allow create: if isAuthenticated() && request.auth.uid == userId && (
+        !('role' in request.resource.data) || request.resource.data.role == 'citizen'
+      );
+      allow update: if isAuthenticated() && request.auth.uid == userId && (
+        // Prevent citizens from privilege escalating their role
+        !('role' in request.resource.data) || request.resource.data.role == resource.data.role || isClerkOrAdmin()
+      );
+      allow delete: if false;
+    }
+
+    // ============================================================
+    // CLERK / ROUTING OFFICER PROFILES
+    // ============================================================
+    match /clerks/{clerkId} {
+      allow read: if isAuthenticated();
+      allow create, update: if isAuthenticated() && (request.auth.uid == clerkId || isClerkOrAdmin());
+      allow delete: if false;
+    }
+
+    // ============================================================
+    // DEPARTMENTS & CATALOG (Public read, Clerk-managed)
+    // ============================================================
+    match /departments/{departmentId} {
+      allow read: if true;
+      allow write: if isClerkOrAdmin();
+    }
+
+    // ============================================================
+    // CORE APPLICATIONS COLLECTION (Canonical Source of Truth)
+    // ============================================================
+    match /applications/{applicationId} {
+      // Citizen reads their own applications; Clerk/Admin reads all queue items
+      allow read: if isAuthenticated() && (
+        resource.data.userId == request.auth.uid || isClerkOrAdmin()
+      );
+
+      // Citizen can initiate their application
+      allow create: if isAuthenticated() &&
+        request.resource.data.userId == request.auth.uid &&
+        request.resource.data.status in [
+          'draft',
+          'ai_processing',
+          'awaiting_user_confirmation',
+          'submitted',
+          'human_review_required'
+        ];
+
+      // Update rules enforce separation of duties
+      allow update: if isAuthenticated() && (
+        // Citizen updates: allowed during draft/confirmation OR when responding to clarification
+        (resource.data.userId == request.auth.uid && (
+          (resource.data.status in ['draft', 'ai_processing', 'awaiting_user_confirmation']) ||
+          (resource.data.status == 'clarification_required' && request.resource.data.status in ['resubmitted', 'clarification_required'])
+        ) &&
+        // Citizens CANNOT self-approve, route, or override
+        !(request.resource.data.status in ['approved', 'routed', 'under_clerk_review'])) ||
+        // Clerks can review, request clarification, approve, route, and save notes
+        isClerkOrAdmin()
+      );
+
+      allow delete: if isOwner(resource.data.userId) && resource.data.status == 'draft';
+
+      // Immutable Audit Event Timeline sub-collection
+      match /events/{eventId} {
+        allow read: if isAuthenticated() && (
+          get(/databases/$(database)/documents/applications/$(applicationId)).data.userId == request.auth.uid ||
+          isClerkOrAdmin()
+        );
+        allow create: if isAuthenticated();
+        allow update, delete: if false; // Strict audit immutability
+      }
+
+      // Clarifications sub-collection
+      match /clarifications/{clarificationId} {
+        allow read: if isAuthenticated() && (
+          get(/databases/$(database)/documents/applications/$(applicationId)).data.userId == request.auth.uid ||
+          isClerkOrAdmin()
+        );
+        allow create: if isClerkOrAdmin();
+        allow update: if isAuthenticated() && (
+          get(/databases/$(database)/documents/applications/$(applicationId)).data.userId == request.auth.uid ||
+          isClerkOrAdmin()
+        );
+        allow delete: if false;
+      }
+
+      // Direct Messages sub-collection
+      match /messages/{messageId} {
+        allow read: if isAuthenticated() && (
+          get(/databases/$(database)/documents/applications/$(applicationId)).data.userId == request.auth.uid ||
+          isClerkOrAdmin()
+        );
+        allow create: if isAuthenticated() && (
+          get(/databases/$(database)/documents/applications/$(applicationId)).data.userId == request.auth.uid ||
+          isClerkOrAdmin()
+        );
+        allow update, delete: if false;
+      }
+    }
+
+    // ============================================================
+    // RTI_APPLICATIONS COLLECTION (Synchronized Mirror)
+    // Symmetrical security rules to prevent bypass
+    // ============================================================
+    match /rti_applications/{applicationId} {
+      allow read: if isAuthenticated() && (
+        resource.data.userId == request.auth.uid || isClerkOrAdmin()
+      );
+
+      allow create: if isAuthenticated() &&
+        request.resource.data.userId == request.auth.uid &&
+        request.resource.data.status in [
+          'draft',
+          'ai_processing',
+          'awaiting_user_confirmation',
+          'submitted',
+          'human_review_required'
+        ];
+
+      allow update: if isAuthenticated() && (
+        (resource.data.userId == request.auth.uid && (
+          (resource.data.status in ['draft', 'ai_processing', 'awaiting_user_confirmation']) ||
+          (resource.data.status == 'clarification_required' && request.resource.data.status in ['resubmitted', 'clarification_required'])
+        ) &&
+        !(request.resource.data.status in ['approved', 'routed', 'under_clerk_review'])) ||
+        isClerkOrAdmin()
+      );
+
+      allow delete: if isOwner(resource.data.userId) && resource.data.status == 'draft';
+
+      match /events/{eventId} {
+        allow read: if isAuthenticated() && (
+          get(/databases/$(database)/documents/rti_applications/$(applicationId)).data.userId == request.auth.uid ||
+          isClerkOrAdmin()
+        );
+        allow create: if isAuthenticated();
+        allow update, delete: if false;
+      }
+
+      match /clarifications/{clarificationId} {
+        allow read: if isAuthenticated() && (
+          get(/databases/$(database)/documents/rti_applications/$(applicationId)).data.userId == request.auth.uid ||
+          isClerkOrAdmin()
+        );
+        allow create: if isClerkOrAdmin();
+        allow update: if isAuthenticated() && (
+          get(/databases/$(database)/documents/rti_applications/$(applicationId)).data.userId == request.auth.uid ||
+          isClerkOrAdmin()
+        );
+        allow delete: if false;
+      }
+
+      match /messages/{messageId} {
+        allow read, create: if isAuthenticated() && (
+          get(/databases/$(database)/documents/rti_applications/$(applicationId)).data.userId == request.auth.uid ||
+          isClerkOrAdmin()
+        );
+        allow update, delete: if false;
+      }
+    }
+
+    // ============================================================
+    // APPLICATION_EVENTS (Top-Level Audit Log Mirror)
+    // ============================================================
+    match /application_events/{eventId} {
+      allow read: if isAuthenticated();
+      allow create: if isAuthenticated();
+      allow update, delete: if false; // Immutable append-only
+    }
+
+    // ============================================================
+    // NOTIFICATIONS
+    // ============================================================
+    match /notifications/{notificationId} {
+      allow read: if isAuthenticated() && resource.data.userId == request.auth.uid;
+      allow create: if isAuthenticated();
+      allow update: if isAuthenticated() && resource.data.userId == request.auth.uid;
+      allow delete: if isAuthenticated() && resource.data.userId == request.auth.uid;
+    }
+  }
+}
